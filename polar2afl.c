@@ -83,6 +83,12 @@ typedef struct {
 
 static bool	do_smooth_polars = true;
 static double	edge_blend_range = 10;	/* degrees */
+static bool	do_reshape_cd = false;
+static double	cd_peak_pos_angle = 90.0;
+static double	cd_peak_pos_value = 1.7;
+static double	cd_peak_neg_angle = -90.0;
+static double	cd_peak_neg_value = 1.5;
+static double	cd_peak_sigma = 25.0;
 
 static void afl_free(afl_t *afl);
 static polar_diag_t *smooth_diag(polar_diag_t *d);
@@ -693,6 +699,41 @@ smooth_diag(polar_diag_t *d1)
 	return (d2);
 }
 
+/*
+ * Function added by Alejandro Zuluaga
+ * Reshapes the high alpha drag region to match the desired peak values.
+ */
+
+static void
+afl_reshape_high_alpha_drag(polar_diag_t *diag)
+{
+	polar_t *p_pos, *p_neg;
+	double delta_pos, delta_neg;
+	double current_cd_pos, current_cd_neg;
+
+	p_pos = find_nearest_polar(diag, cd_peak_pos_angle);
+	p_neg = find_nearest_polar(diag, cd_peak_neg_angle);
+
+	current_cd_pos = p_pos->Cd;
+	current_cd_neg = p_neg->Cd;
+
+	delta_pos = cd_peak_pos_value - current_cd_pos;
+	delta_neg = cd_peak_neg_value - current_cd_neg;
+
+	for (polar_t *p = avl_first(&diag->polars); p != NULL;
+	    p = AVL_NEXT(&diag->polars, p)) {
+		double weight_pos, weight_neg;
+
+		weight_pos = exp(-pow(p->alpha - cd_peak_pos_angle, 2) /
+		    (2 * pow(cd_peak_sigma, 2)));
+		p->Cd += delta_pos * weight_pos;
+
+		weight_neg = exp(-pow(p->alpha - cd_peak_neg_angle, 2) /
+		    (2 * pow(cd_peak_sigma, 2)));
+		p->Cd += delta_neg * weight_neg;
+	}
+}
+
 static void
 afl_combine_diag(polar_diag_t *d1, const polar_diag_t *d2)
 {
@@ -730,6 +771,9 @@ afl_combine_diag(polar_diag_t *d1, const polar_diag_t *d2)
 			Cd_min_Cl = p->Cl;
 		}
 	}
+
+	if (do_reshape_cd)
+		afl_reshape_high_alpha_drag(d1);
 
 	assert(isfinite(Cl_max));
 	assert(!isnan(Cl_max_alpha));
@@ -790,8 +834,9 @@ afl_combine(afl_t *afl, const afl_t *xfoil)
 static void
 print_usage(FILE *fp, const char *progname)
 {
-	fprintf(fp, "Usage: %s [-hs] [-c <chord>] [-e <range>] <input.afl> "
-	    "<output.afl> [polar.txt...]\n"
+	fprintf(fp, "Usage: %s [-hs] [-c <chord>] [-e <range>] "
+	    "[-P <angle:value>] [-N <angle:value>] [-W <width>] "
+	    "<input.afl> <output.afl> [polar.txt...]\n"
 	    "\n"
 	    "  Copyright 2020 Saso Kiselkov. All rights reserved.\n"
 	    "\n"
@@ -854,7 +899,22 @@ print_usage(FILE *fp, const char *progname)
 	    "     build script construction.\n"
 	    " -o <output.afl>: you can optionally use the -o option to\n"
 	    "     specify the output file out of order. This helps with\n"
-	    "     build script construction.\n",
+	    "     build script construction.\n"
+	    " -P <angle:value>: reshape the Cd curve to reach a target value\n"
+	    "     at a specified positive angle of attack. For example,\n"
+	    "     '-P 90:1.7' will adjust Cd to reach 1.7 at 90 degrees.\n"
+	    "     This is useful for correcting high-alpha drag values in\n"
+	    "     X-Plane's default airfoils. The adjustment uses a Gaussian\n"
+	    "     weighting function for smooth blending.\n"
+	    " -N <angle:value>: reshape the Cd curve to reach a target value\n"
+	    "     at a specified negative angle of attack. For example,\n"
+	    "     '-N -90:1.5' will adjust Cd to reach 1.5 at -90 degrees.\n"
+	    "     Cambered airfoils typically have different drag values at\n"
+	    "     positive vs negative stall angles.\n"
+	    " -W <width>: adjusts the width (sigma) of the Gaussian weighting\n"
+	    "     function used for Cd reshaping (default: 25.0 degrees).\n"
+	    "     Larger values create a wider, more gradual adjustment.\n"
+	    "     Smaller values create a narrower, more localized peak.\n",
 	    progname, progname);
 }
 
@@ -869,7 +929,7 @@ main(int argc, char *argv[])
 	const char *progname = argv[0];
 	double chord = 1;
 
-	while ((opt = getopt(argc, argv, "hse:i:o:c:")) != -1) {
+	while ((opt = getopt(argc, argv, "hse:i:o:c:P:N:W:")) != -1) {
 		switch (opt) {
 		case 'h':
 			print_usage(stdout, argv[0]);
@@ -895,6 +955,32 @@ main(int argc, char *argv[])
 			chord = atof(optarg);
 			if (chord <= 0) {
 				fprintf(stderr, "Invalid chord length. "
+				    "Must be a positive number.\n");
+				return (1);
+			}
+			break;
+		case 'P':
+			do_reshape_cd = true;
+			if (sscanf(optarg, "%lf:%lf", &cd_peak_pos_angle,
+			    &cd_peak_pos_value) != 2) {
+				fprintf(stderr, "Invalid positive Cd peak format. "
+				    "Use: angle:value (e.g., 90:1.7)\n");
+				return (1);
+			}
+			break;
+		case 'N':
+			do_reshape_cd = true;
+			if (sscanf(optarg, "%lf:%lf", &cd_peak_neg_angle,
+			    &cd_peak_neg_value) != 2) {
+				fprintf(stderr, "Invalid negative Cd peak format. "
+				    "Use: angle:value (e.g., -90:1.5)\n");
+				return (1);
+			}
+			break;
+		case 'W':
+			cd_peak_sigma = atof(optarg);
+			if (cd_peak_sigma <= 0) {
+				fprintf(stderr, "Invalid Cd peak width. "
 				    "Must be a positive number.\n");
 				return (1);
 			}
